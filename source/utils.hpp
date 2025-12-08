@@ -952,62 +952,48 @@ void initializeTheme(const std::string& themeIniPath = THEME_CONFIG_INI_PATH) {
 
 
 /**
- * @brief Copy Tesla key combo to Ultrahand settings.
+ * @brief Synchronize Tesla and Ultrahand key combos.
  *
- * This function retrieves the key combo from Tesla settings and copies it to Ultrahand settings.
+ * This function synchronizes key combos between Tesla and Ultrahand settings.
+ * - If Tesla has a combo and Ultrahand doesn't: copy Tesla → Ultrahand
+ * - If Ultrahand has a combo and Tesla doesn't or differs: copy Ultrahand → Tesla
+ * - If neither has a combo: do nothing
+ * 
+ * @return true if neither config has a combo, false otherwise
  */
-void copyTeslaKeyComboToUltrahand() {
-    std::string keyCombo = ULTRAHAND_COMBO_STR;
-    std::map<std::string, std::map<std::string, std::string>> parsedData;
-    
-    const bool teslaConfigExists = isFileOrDirectory(TESLA_CONFIG_INI_PATH);
-    const bool ultrahandConfigExists = isFileOrDirectory(ULTRAHAND_CONFIG_INI_PATH);
-
-    bool initializeTesla = false;
-    std::string teslaKeyCombo = keyCombo;
-
-    if (teslaConfigExists) {
-        parsedData = getParsedDataFromIniFile(TESLA_CONFIG_INI_PATH);
-        if (parsedData.count(TESLA_STR) > 0) {
-            auto& teslaSection = parsedData[TESLA_STR];
-            if (teslaSection.count(KEY_COMBO_STR) > 0) {
-                teslaKeyCombo = teslaSection[KEY_COMBO_STR];
-            } else {
-                initializeTesla = true;
-            }
-        } else {
-            initializeTesla = true;
-        }
-    } else {
-        initializeTesla = true;
+bool copyTeslaKeyComboToUltrahand() {
+    // Check for Tesla key combo
+    bool hasTeslaKeyCombo = false;
+    std::string teslaKeyCombo;
+    if (isFile(TESLA_CONFIG_INI_PATH)) {
+        teslaKeyCombo = parseValueFromIniSection(TESLA_CONFIG_INI_PATH, TESLA_STR, KEY_COMBO_STR);
+        hasTeslaKeyCombo = !teslaKeyCombo.empty();
     }
     
-    bool initializeUltrahand = false;
-    if (ultrahandConfigExists) {
-        parsedData = getParsedDataFromIniFile(ULTRAHAND_CONFIG_INI_PATH);
-        if (parsedData.count(ULTRAHAND_PROJECT_NAME) > 0) {
-            auto& ultrahandSection = parsedData[ULTRAHAND_PROJECT_NAME];
-            if (ultrahandSection.count(KEY_COMBO_STR) > 0) {
-                keyCombo = ultrahandSection[KEY_COMBO_STR];
-            } else {
-                initializeUltrahand = true;
-            }
-        } else {
-            initializeUltrahand = true;
-        }
-    } else {
-        initializeUltrahand = true;
+    // Check for Ultrahand key combo
+    bool hasUltrahandKeyCombo = false;
+    std::string ultrahandKeyCombo;
+    if (isFile(ULTRAHAND_CONFIG_INI_PATH)) {
+        ultrahandKeyCombo = parseValueFromIniSection(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, KEY_COMBO_STR);
+        hasUltrahandKeyCombo = !ultrahandKeyCombo.empty();
     }
-
-    if (initializeTesla || (teslaKeyCombo != keyCombo)) {
-        setIniFileValue(TESLA_CONFIG_INI_PATH, TESLA_STR, KEY_COMBO_STR, keyCombo);
+    
+    // Apply sync logic
+    if (hasTeslaKeyCombo && !hasUltrahandKeyCombo) {
+        // Tesla has combo, Ultrahand doesn't → copy Tesla to Ultrahand
+        setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, KEY_COMBO_STR, teslaKeyCombo);
+    } else if (hasUltrahandKeyCombo && (!hasTeslaKeyCombo || teslaKeyCombo != ultrahandKeyCombo)) {
+        // Ultrahand has combo and (Tesla doesn't OR they differ) → copy Ultrahand to Tesla
+        setIniFileValue(TESLA_CONFIG_INI_PATH, TESLA_STR, KEY_COMBO_STR, ultrahandKeyCombo);
     }
-
-    if (initializeUltrahand) {
-        setIniFileValue(ULTRAHAND_CONFIG_INI_PATH, ULTRAHAND_PROJECT_NAME, KEY_COMBO_STR, keyCombo);
+    
+    // Return true if neither has a combo
+    if (!hasTeslaKeyCombo && !hasUltrahandKeyCombo) {
+        return true;
     }
-
+    
     tsl::impl::parseOverlaySettings();
+    return false;
 }
 
 
@@ -1269,6 +1255,7 @@ std::string getFirstSectionText(const std::vector<std::vector<std::string>>& tab
             } else if (commandName == JSON_STR) {
                 if (cmdSize >= 2) {
                     jsonString = cmd[1];
+                    removeQuotes(jsonString);
                     // Process jsonString if needed
                 }
             } else if (commandName == JSON_FILE_STR) {
@@ -1513,7 +1500,7 @@ static bool buildTableDrawerLines(
                 if (cmd[0] == "list_file_source" && cmd.size() >= 2 && listFileSourcePath.empty()) {
                     listFileSourcePath = cmd[1];
                     preprocessPath(listFileSourcePath, packagePath);
-                    lines = readListFromFile(listFileSourcePath);
+                    lines = readListFromFile(listFileSourcePath, 0, true);
                     for (const auto& line : lines) {
                         baseSection.push_back(line);
                         baseInfo.push_back("");
@@ -1529,6 +1516,7 @@ static bool buildTableDrawerLines(
                 }
                 else if (cmd[0] == JSON_STR && cmd.size() >= 2) {
                     jsonString = cmd[1];
+                    removeQuotes(jsonString);
                 }
                 else if (cmd[0] == JSON_FILE_STR && cmd.size() >= 2) {
                     jsonPath = cmd[1];
@@ -2230,17 +2218,6 @@ void applyReplaceIniPlaceholder(std::string& arg, const std::string& commandName
  * @brief Replaces a JSON source placeholder with the actual JSON source.
  *
  * Optimized version with variables moved to usage scope to avoid repeated allocations.
- *
- * @param arg The input string containing the placeholder.
- * @param commandName The name of the JSON command (e.g., "json", "json_file").
- * @param jsonPathOrString The path to the JSON file or the JSON string itself.
- * @return std::string The input string with the placeholder replaced by the actual JSON source,
- *                   or the original input string if replacement failed or jsonDict is nullptr.
- */
-/**
- * @brief Replaces a JSON source placeholder with the actual JSON source.
- *
- * Optimized version with variables moved outside loops to avoid repeated allocations.
  *
  * @param arg The input string containing the placeholder.
  * @param commandName The name of the JSON command (e.g., "json", "json_file").
@@ -2967,9 +2944,9 @@ bool replacePlaceholdersRecursively(
 
                 // Call the replacer on the resolved placeholder
                 replacement = replacer(resolvedPlaceholder);
-                if (replacement.empty()) {
-                    replacement = NULL_STR; // preserve your NULL_STR convention
-                }
+                //if (replacement.empty()) {
+                //    replacement = NULL_STR; // preserve your NULL_STR convention
+                //}
 
                 // Perform replacement if it changes anything
                 const std::string before = arg;
@@ -3093,6 +3070,10 @@ bool applyPlaceholderReplacements(std::vector<std::string>& cmd, const std::stri
             //size_t endPos = placeholder.find(")");
             //std::string hexValue = placeholder.substr(startPos, placeholder.find(")") - startPos);
             return returnOrNull(hexToDecimal(placeholder.substr(startPos, placeholder.find(")") - startPos)));
+        }},
+        {"{base64_decode(", [&](const std::string& placeholder) {
+            const size_t startPos = placeholder.find("(") + 1;
+            return returnOrNull(decodeBase64ToString(placeholder.substr(startPos, placeholder.find(")") - startPos)));
         }},
         {"{random(", [&](const std::string& placeholder) {
             std::srand(std::time(0));
@@ -3330,6 +3311,7 @@ bool applyPlaceholderReplacementsToCommands(std::vector<std::vector<std::string>
             shouldKeep = false;
         } else if (commandName == JSON_STR && cmdSize >= 2) {
             jsonString = cmd[1];
+            removeQuotes(jsonString);
             shouldKeep = false;
         } else if (commandName == JSON_FILE_STR && cmdSize >= 2) {
             jsonPath = cmd[1];
@@ -3637,6 +3619,7 @@ bool interpretAndExecuteCommands(std::vector<std::vector<std::string>>&& command
         else if (commandName == JSON_STR) {
             if (cmdSize >= 2) {
                 jsonString = cmd[1];
+                removeQuotes(jsonString);  // ADD THIS LINE
             }
         } 
         else if (commandName == JSON_FILE_STR) {
@@ -4127,12 +4110,7 @@ void handleIniCommands(const std::vector<std::string>& cmd, const std::string& p
         std::string desiredKey = cmd[3];
         removeQuotes(desiredKey);
         
-        std::string desiredValue;
-        for (size_t i = 4; i < cmdSize; ++i) {
-            if (i > 4)
-                desiredValue += ' ';
-            desiredValue += cmd[i];
-        }
+        std::string desiredValue = cmd[4];
         removeQuotes(desiredValue);
         
         setIniFileValue(sourcePath, desiredSection, desiredKey, desiredValue);
@@ -4141,15 +4119,36 @@ void handleIniCommands(const std::vector<std::string>& cmd, const std::string& p
         std::string desiredKey = cmd[3];
         removeQuotes(desiredKey);
         
-        std::string desiredNewKey;
-        for (size_t i = 4; i < cmdSize; ++i) {
-            if (i > 4)
-                desiredNewKey += ' ';
-            desiredNewKey += cmd[i];
-        }
+        std::string desiredNewKey = cmd[4];
         removeQuotes(desiredNewKey);
         
         setIniFileKey(sourcePath, desiredSection, desiredKey, desiredNewKey);
+    } else if (command == "set-ini-val-matching-key" && cmdSize >= 5) {
+        // set-ini-val-matching-key <file> <patternKey> <newKey> <newValue>
+        // desiredSection is used as patternKey here (empty string = all sections)
+        std::string desiredKey = cmd[3];
+        removeQuotes(desiredKey);
+        
+        std::string desiredValue = cmd[4];
+        removeQuotes(desiredValue);
+        
+        if (!ult::isFile(sourcePath))
+            commandSuccess.store(false, std::memory_order_release);
+
+        // desiredSection here is the pattern key
+        addKeyToMatchingSections(sourcePath, desiredSection, desiredKey, desiredValue);
+        
+    } else if (command == "remove-ini-key-matching-key" && cmdSize >= 4) {
+        // remove-ini-key-matching-key <file> <patternKey> <keyToRemove>
+        // desiredSection is used as patternKey here (empty string = all sections)
+        std::string desiredKey = cmd[3];
+        removeQuotes(desiredKey);
+        
+        if (!ult::isFile(sourcePath))
+            commandSuccess.store(false, std::memory_order_release);
+
+        // desiredSection here is the pattern key
+        removeKeyFromMatchingSections(sourcePath, desiredSection, desiredKey);
     }
 }
 
@@ -4499,6 +4498,7 @@ void processCommand(const std::vector<std::string>& cmd, const std::string& pack
                 tsl::Overlay::get()->close(true);
                 return;
             }
+
             break;
             
         case 'f':
@@ -4655,6 +4655,17 @@ void processCommand(const std::vector<std::string>& cmd, const std::string& pack
             break;
             
         case 'p':
+            if (commandName == "path_exists") {
+                if (cmdSize >= 2) {
+                    std::string sourcePath = cmd[1];
+                    preprocessPath(sourcePath, packagePath);
+                    if (ult::isFileOrDirectory(sourcePath)) {
+                        commandSuccess.store(true, std::memory_order_release);
+                    } else {
+                        commandSuccess.store(false, std::memory_order_release);
+                    }
+                }
+            }
             if (commandName == "pchtxt2ips") {
                 if (cmdSize >= 3) {
                     std::string sourcePath = cmd[1];
@@ -4687,7 +4698,7 @@ void processCommand(const std::vector<std::string>& cmd, const std::string& pack
                 return;
             }
             if (commandName == "rename-ini-section" || commandName == "remove-ini-section" || 
-                commandName == "remove-ini-key") {
+                commandName == "remove-ini-key" || commandName == "remove-ini-key-matching-key") {
                 handleIniCommands(cmd, packagePath);
                 return;
             }
@@ -4813,7 +4824,7 @@ void processCommand(const std::vector<std::string>& cmd, const std::string& pack
             
         case 's':
             if (commandName == "set-ini-val" || commandName == "set-ini-value" || 
-                commandName == "set-ini-key") {
+                commandName == "set-ini-key" || commandName == "set-ini-val-matching-key") {
                 handleIniCommands(cmd, packagePath);
                 return;
             }
