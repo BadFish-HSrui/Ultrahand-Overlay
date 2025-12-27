@@ -538,9 +538,14 @@ void fuseDumpToIni(const std::string& outputPath = FUSE_DATA_INI_PATH) {
 std::string getLocalIpAddress() {
     Result rc;
     u32 ipAddress;
-
-    ASSERT_FATAL(nifmInitialize(NifmServiceType_User)); // for local IP
-
+    
+    // Initialize nifm service
+    rc = nifmInitialize(NifmServiceType_System);
+    if (R_FAILED(rc)) {
+        // Failed to initialize, return default
+        return UNAVAILABLE_SELECTION;
+    }
+    
     // Get the current IP address
     rc = nifmGetCurrentIpAddress(&ipAddress);
     if (R_SUCCEEDED(rc)) {
@@ -554,8 +559,9 @@ std::string getLocalIpAddress() {
         nifmExit();
         return std::string(ipStr);
     } else {
-        // Return a default IP address if the IP could not be retrieved
-        return UNAVAILABLE_SELECTION;  // Or "Unknown" if you prefer
+        // Clean up before returning default
+        nifmExit();
+        return UNAVAILABLE_SELECTION;
     }
 }
 
@@ -565,7 +571,7 @@ std::string getLocalIpAddress() {
 // Function to remove all empty command strings
 void removeEmptyCommands(std::vector<std::vector<std::string>>& commands) {
     commands.erase(std::remove_if(commands.begin(), commands.end(),
-        [](const std::vector<std::string>& vec) {
+        [](const std::vector<std::string>& vec) noexcept {
             return vec.empty();
         }),
         commands.end());
@@ -2218,6 +2224,7 @@ void applyReplaceIniPlaceholder(std::string& arg, const std::string& commandName
  * @brief Replaces a JSON source placeholder with the actual JSON source.
  *
  * Optimized version with variables moved to usage scope to avoid repeated allocations.
+ * Supports "null" key as a fallback default for failed lookups.
  *
  * @param arg The input string containing the placeholder.
  * @param commandName The name of the JSON command (e.g., "json", "json_file").
@@ -2256,6 +2263,9 @@ std::string replaceJsonPlaceholder(const std::string& arg, const std::string& co
     std::string key;
     bool validValue;
     
+    // Keep reference to root for "null" fallback lookups
+    cJSON* root = reinterpret_cast<cJSON*>(jsonDict.get());
+    
     while (startPos != std::string::npos) {
         endPos = arg.find(")}", startPos);
         if (endPos == std::string::npos) {
@@ -2266,7 +2276,7 @@ std::string replaceJsonPlaceholder(const std::string& arg, const std::string& co
         result.append(arg, lastPos, startPos - lastPos);
         
         nextPos = startPos + searchStringLen;
-        cJSON* value = reinterpret_cast<cJSON*>(jsonDict.get()); // Get the JSON root object
+        cJSON* value = root; // Start from root
         validValue = true;
         
         while (nextPos < endPos && validValue) {
@@ -2290,11 +2300,16 @@ std::string replaceJsonPlaceholder(const std::string& arg, const std::string& co
         }
         
         if (validValue && value && cJSON_IsString(value) && value->valuestring) {
-            result.append(value->valuestring); // Append replacement value
+            // Append the value as-is, even if it's an empty string
+            result.append(value->valuestring);
         } else {
-            // If replacement failed, keep the original placeholder
-            //result.append(arg, startPos, endPos + 2 - startPos);
-            result.append(NULL_STR);
+            // Key doesn't exist or isn't a string - try "null" fallback
+            cJSON* fallbackValue = cJSON_GetObjectItemCaseSensitive(root, NULL_STR.c_str());
+            if (fallbackValue && cJSON_IsString(fallbackValue) && fallbackValue->valuestring) {
+                result.append(fallbackValue->valuestring);
+            } else {
+                result.append(NULL_STR);
+            }
         }
         
         lastPos = endPos + 2;
@@ -2433,10 +2448,9 @@ std::vector<std::vector<std::string>> getSourceReplacement(const std::vector<std
                 if (modifiedArg.find("{list_source(") != std::string::npos) {
                     applyPlaceholderReplacement(modifiedArg, "*", indexStr);
                     startPos = modifiedArg.find("{list_source(");
-                    endPos   = modifiedArg.find(")}");
+                    endPos   = modifiedArg.find(")}", startPos + 13);  // Find )}  after the opening
                     if (endPos != std::string::npos && endPos > startPos) {
-                        // SAFE: Use at() which does bounds checking, or catch the access
-                        const auto& listItems = stringToList(listString);  // const reference - no copy
+                        const auto& listItems = stringToList(listString);
                         raw = (entryIndex < listItems.size()) ? listItems[entryIndex] : "";
                         replacement = returnOrNull(raw);
                         modifiedArg.replace(startPos, endPos - startPos + 2, replacement);
@@ -2447,7 +2461,8 @@ std::vector<std::vector<std::string>> getSourceReplacement(const std::vector<std
                 if (modifiedArg.find("{list_file_source(") != std::string::npos) {
                     applyPlaceholderReplacement(modifiedArg, "*", indexStr);
                     startPos = modifiedArg.find("{list_file_source(");
-                    endPos   = modifiedArg.find(")}");
+                    // Find the closing )}  AFTER the opening we just found
+                    endPos = modifiedArg.find(")}", startPos + 18);  // 18 = length of "{list_file_source("
                     if (endPos != std::string::npos && endPos > startPos) {
                         raw = getEntryFromListFile(listPath, entryIndex);
                         replacement = returnOrNull(raw);
@@ -2467,7 +2482,7 @@ std::vector<std::vector<std::string>> getSourceReplacement(const std::vector<std
                 if (modifiedArg.find("{json_source(") != std::string::npos) {
                     applyPlaceholderReplacement(modifiedArg, "*", indexStr);
                     startPos = modifiedArg.find("{json_source(");
-                    endPos   = modifiedArg.find(")}");
+                    endPos   = modifiedArg.find(")}", startPos + 13);  // Find )}  after the opening
                     if (endPos != std::string::npos && endPos > startPos) {
                         raw = replaceJsonPlaceholder(
                             modifiedArg.substr(startPos, endPos - startPos + 2),
@@ -2479,11 +2494,12 @@ std::vector<std::vector<std::string>> getSourceReplacement(const std::vector<std
                     }
                 }
 
+
                 // {json_file_source(...)} block
                 if (modifiedArg.find("{json_file_source(") != std::string::npos) {
                     applyPlaceholderReplacement(modifiedArg, "*", indexStr);
                     startPos = modifiedArg.find("{json_file_source(");
-                    endPos   = modifiedArg.find(")}");
+                    endPos   = modifiedArg.find(")}", startPos + 18);  // Find )}  after the opening
                     if (endPos != std::string::npos && endPos > startPos) {
                         raw = replaceJsonPlaceholder(
                             modifiedArg.substr(startPos, endPos - startPos + 2),
@@ -2885,10 +2901,42 @@ static size_t findMatchingClose(const std::string& s,
     return std::string::npos; // unmatched
 }
 
+
+/**
+ * @brief Recursively resolves nested placeholders in a string from innermost to outermost.
+ *
+ * This function processes function-style placeholders (e.g., {math(...)}, {split(...)}, {slice(...)})
+ * by recursively resolving their inner content first, then applying the outer transformation.
+ * It uses a universal approach that attempts to resolve all placeholders it can, and intelligently
+ * skips outer placeholders when inner placeholders cannot be resolved (e.g., source placeholders
+ * that require external context from getSourceReplacement).
+ *
+ * Resolution Process:
+ * 1. Finds a placeholder pattern like {function(...)}
+ * 2. Extracts and recursively resolves the inner content
+ * 3. If inner content couldn't be resolved (unchanged and still contains placeholders),
+ *    skips the outer placeholder and leaves it intact for later resolution
+ * 4. If inner content was successfully resolved, applies the outer function transformation
+ * 5. Continues until no more replacements can be made
+ *
+ * Examples:
+ * - {split({math(5+5)},",",0)} → Resolves math first (10), then split → Final result
+ * - {split({list_source(*)},",",0)} → Inner can't resolve → Entire placeholder preserved
+ * - {math({ram_vendor}+5)} → ram_vendor already resolved → Processes math → Final result
+ *
+ * @param arg The string to process, modified in-place with resolved placeholders
+ * @param placeholders Vector of placeholder patterns and their resolver functions.
+ *                     Each pair contains: opener pattern (e.g., "{math(") and resolver lambda
+ * @return true if any replacements were made, false otherwise
+ *
+ * @note Simple placeholders like {ram_vendor}, {hos_version} should be resolved by
+ *       replacePlaceholdersInArg() before calling this function.
+ * @note Source placeholders like {list_source(*)}, {file_source} are resolved in
+ *       getSourceReplacement() and will be skipped by this function.
+ */
 bool replacePlaceholdersRecursively(
     std::string& arg,
-    const std::vector<std::pair<std::string, std::function<std::string(const std::string&)>>>& placeholders)
-{
+    const std::vector<std::pair<std::string, std::function<std::string(const std::string&)>>>& placeholders) {
     bool anyReplacementsMade = false;
 
     // Precompute all opener tokens ("{slice(", "{math(", ...).
@@ -2902,12 +2950,13 @@ bool replacePlaceholdersRecursively(
     size_t searchPos;
     std::string replacement;
     std::string inner;
+    std::string innerBeforeRecursion;
 
-    // Keep sweeping until no replacements occur.
+    // Keep sweeping until no replacements occur
     for (;;) {
         replacedThisPass = false;
 
-        // Try each placeholder type.
+        // Try each placeholder type
         for (size_t t = 0; t < placeholders.size(); ++t) {
             const auto& opener = placeholders[t].first;      // e.g., "{slice("
             const auto& replacer = placeholders[t].second;
@@ -2933,37 +2982,42 @@ bool replacePlaceholdersRecursively(
 
                 // Resolve INNER content first (exclude the outer wrapper)
                 const size_t innerStart = opener.size();
-                const size_t innerLen   = placeholderText.size() - innerStart - 2; // minus ")}"
+                const size_t innerLen = placeholderText.size() - innerStart - 2; // minus ")}"
                 inner = placeholderText.substr(innerStart, innerLen);
 
-                // Recurse on inner only (so we don't re-match the outer opener)
+                // Save the original inner content before recursion
+                innerBeforeRecursion = inner;
+
+                // Recurse on inner to resolve any nested placeholders
                 replacePlaceholdersRecursively(inner, placeholders);
 
-                // Rebuild the outer placeholder with resolved args
+                // Check if recursion made progress
+                // If inner didn't change AND still contains placeholder patterns,
+                // it means the inner placeholders couldn't be resolved
+                // Skip this outer placeholder and leave it for later resolution
+                if (inner == innerBeforeRecursion && inner.find('{') != std::string::npos) {
+                    searchPos = startPos + opener.size();
+                    continue;
+                }
+
+                // Rebuild the outer placeholder with resolved inner args
                 const std::string resolvedPlaceholder = opener + inner + ")}";
 
-                // Call the replacer on the resolved placeholder
+                // Call the replacer on the fully resolved placeholder
                 replacement = replacer(resolvedPlaceholder);
-                //if (replacement.empty()) {
-                //    replacement = NULL_STR; // preserve your NULL_STR convention
-                //}
 
-                // Perform replacement if it changes anything
-                const std::string before = arg;
+                // Perform replacement
                 arg.replace(startPos, fullLen, replacement);
-
-                if (arg != before) {
-                    anyReplacementsMade = true;
-                    replacedThisPass = true;
-                    // Continue scanning after the replacement
-                    searchPos = startPos + replacement.size();
-                } else {
-                    // If nothing changed, advance to avoid re-hitting the same spot
-                    searchPos = startPos + opener.size();
-                }
+                
+                anyReplacementsMade = true;
+                replacedThisPass = true;
+                
+                // Continue scanning after the replacement
+                searchPos = startPos + replacement.size();
             }
         }
 
+        // If no replacements were made this pass, we're done
         if (!replacedThisPass) break;
     }
 
@@ -2991,44 +3045,75 @@ void updateGeneralPlaceholders() {
     };
 }
 
-bool applyPlaceholderReplacements(std::vector<std::string>& cmd, const std::string& hexPath, const std::string& iniPath, const std::string& listString, const std::string& listPath, const std::string& jsonString, const std::string& jsonPath) {
+bool applyPlaceholderReplacements(std::vector<std::string>& cmd, const std::string& hexPath, 
+                                 const std::string& iniPath, const std::string& listString, 
+                                 const std::string& listPath, const std::string& jsonString, 
+                                 const std::string& jsonPath) {
     bool replacementsMade = false;
     
     std::vector<std::pair<std::string, std::function<std::string(const std::string&)>>> placeholders = {
-        {"{hex_file(", [&](const std::string& placeholder) { return returnOrNull(replaceHexPlaceholder(placeholder, hexPath)); }},
+        {"{hex_file(", [&](const std::string& placeholder) { 
+            std::string result = replaceHexPlaceholder(placeholder, hexPath);
+            return returnOrNull(result);
+        }},
         {"{ini_file(", [&](const std::string& placeholder) { 
             std::string result = placeholder;
             applyReplaceIniPlaceholder(result, INI_FILE_STR, iniPath); 
-            return returnOrNull(result); 
+            return result;
         }},
         {"{list(", [&](const std::string& placeholder) {
-            const size_t startPos = placeholder.find('(') + 1;
-            const std::string indexStr = placeholder.substr(startPos, placeholder.find(')') - startPos);
+            const size_t openParen = placeholder.find('(');
+            const size_t closeParen = placeholder.find(')', openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            const std::string indexStr = placeholder.substr(openParen + 1, closeParen - openParen - 1);
             if (!isValidNumber(indexStr)) {
                 return NULL_STR;
             }
-            return returnOrNull(stringToList(listString)[ult::stoi(indexStr)]);
+            const auto& items = stringToList(listString);
+            const size_t idx = ult::stoi(indexStr);
+            if (idx >= items.size()) {
+                return NULL_STR;
+            }
+            return returnOrNull(items[idx]);
         }},
         {"{list_file(", [&](const std::string& placeholder) {
-            const size_t startPos = placeholder.find('(') + 1;
-            std::string indexStr = placeholder.substr(startPos, placeholder.find(')') - startPos);
+            const size_t openParen = placeholder.find('(');
+            const size_t closeParen = placeholder.find(')', openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            const std::string indexStr = placeholder.substr(openParen + 1, closeParen - openParen - 1);
             if (!isValidNumber(indexStr)) {
                 return NULL_STR;
             }
             return returnOrNull(getEntryFromListFile(listPath, ult::stoi(indexStr)));
         }},
-        {"{json(", [&](const std::string& placeholder) { return replaceJsonPlaceholder(placeholder, JSON_STR, jsonString); }},
-        {"{json_file(", [&](const std::string& placeholder) { return replaceJsonPlaceholder(placeholder, JSON_FILE_STR, jsonPath); }},
+        {"{json(", [&](const std::string& placeholder) { 
+            return replaceJsonPlaceholder(placeholder, JSON_STR, jsonString);
+        }},
+        {"{json_file(", [&](const std::string& placeholder) { 
+            return replaceJsonPlaceholder(placeholder, JSON_FILE_STR, jsonPath);
+        }},
         {"{timestamp(", [&](const std::string& placeholder) {
-            const size_t startPos = placeholder.find("(") + 1;
-            const size_t endPos = placeholder.find(")");
-            std::string format = (endPos != std::string::npos) ? placeholder.substr(startPos, endPos - startPos) : "%Y-%m-%d %H:%M:%S";
+            const size_t openParen = placeholder.find("(");
+            const size_t closeParen = placeholder.find(")", openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            std::string format = (closeParen > openParen + 1) ? 
+                placeholder.substr(openParen + 1, closeParen - openParen - 1) : "%Y-%m-%d %H:%M:%S";
             removeQuotes(format);
             return returnOrNull(getCurrentTimestamp(format));
         }},
         {"{decimal_to_hex(", [&](const std::string& placeholder) {
-            const size_t startPos = placeholder.find("(") + 1;
-            const std::string params = placeholder.substr(startPos, placeholder.find(")") - startPos);
+            const size_t openParen = placeholder.find("(");
+            const size_t closeParen = placeholder.find(")", openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            const std::string params = placeholder.substr(openParen + 1, closeParen - openParen - 1);
             
             const size_t commaPos = params.find(",");
             std::string decimalValue;
@@ -3054,33 +3139,46 @@ bool applyPlaceholderReplacements(std::vector<std::string>& cmd, const std::stri
             }
         }},
         {"{ascii_to_hex(", [&](const std::string& placeholder) {
-            const size_t startPos = placeholder.find("(") + 1;
-            //size_t endPos = placeholder.find(")");
-            //std::string asciiValue = placeholder.substr(startPos, placeholder.find(")") - startPos);
-            return returnOrNull(asciiToHex(placeholder.substr(startPos, placeholder.find(")") - startPos)));
+            const size_t openParen = placeholder.find("(");
+            const size_t closeParen = placeholder.find(")", openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            return returnOrNull(asciiToHex(placeholder.substr(openParen + 1, closeParen - openParen - 1)));
         }},
         {"{hex_to_rhex(", [&](const std::string& placeholder) {
-            const size_t startPos = placeholder.find("(") + 1;
-            //size_t endPos = placeholder.find(")");
-            //std::string hexValue = placeholder.substr(startPos, placeholder.find(")") - startPos);
-            return returnOrNull(hexToReversedHex(placeholder.substr(startPos, placeholder.find(")") - startPos)));
+            const size_t openParen = placeholder.find("(");
+            const size_t closeParen = placeholder.find(")", openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            return returnOrNull(hexToReversedHex(placeholder.substr(openParen + 1, closeParen - openParen - 1)));
         }},
         {"{hex_to_decimal(", [&](const std::string& placeholder) {
-            const size_t startPos = placeholder.find("(") + 1;
-            //size_t endPos = placeholder.find(")");
-            //std::string hexValue = placeholder.substr(startPos, placeholder.find(")") - startPos);
-            return returnOrNull(hexToDecimal(placeholder.substr(startPos, placeholder.find(")") - startPos)));
+            const size_t openParen = placeholder.find("(");
+            const size_t closeParen = placeholder.find(")", openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            return returnOrNull(hexToDecimal(placeholder.substr(openParen + 1, closeParen - openParen - 1)));
         }},
         {"{base64_decode(", [&](const std::string& placeholder) {
-            const size_t startPos = placeholder.find("(") + 1;
-            return returnOrNull(decodeBase64ToString(placeholder.substr(startPos, placeholder.find(")") - startPos)));
+            const size_t openParen = placeholder.find("(");
+            const size_t closeParen = placeholder.find(")", openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            return returnOrNull(decodeBase64ToString(placeholder.substr(openParen + 1, closeParen - openParen - 1)));
         }},
         {"{random(", [&](const std::string& placeholder) {
             std::srand(std::time(0));
             
-            const size_t startPos = placeholder.find('(') + 1;
-            const size_t endPos = placeholder.find(')');
-            const std::string parameters = placeholder.substr(startPos, endPos - startPos);
+            const size_t openParen = placeholder.find('(');
+            const size_t closeParen = placeholder.find(')', openParen + 1);
+            if (openParen == std::string::npos || closeParen == std::string::npos) {
+                return NULL_STR;
+            }
+            const std::string parameters = placeholder.substr(openParen + 1, closeParen - openParen - 1);
             const size_t commaPos = parameters.find(',');
             
             if (commaPos != std::string::npos) {
@@ -3106,7 +3204,8 @@ bool applyPlaceholderReplacements(std::vector<std::string>& cmd, const std::stri
         
             const std::string parameters = placeholder.substr(startPos + 1, endPos - startPos - 1);
             const size_t firstComma = parameters.find(',');
-            const size_t secondComma = (firstComma == std::string::npos) ? std::string::npos : parameters.find(',', firstComma + 1);
+            const size_t secondComma = (firstComma == std::string::npos) ? 
+                std::string::npos : parameters.find(',', firstComma + 1);
             if (firstComma == std::string::npos || secondComma == std::string::npos) {
                 return NULL_STR;
             }
@@ -3136,28 +3235,29 @@ bool applyPlaceholderReplacements(std::vector<std::string>& cmd, const std::stri
         
             return returnOrNull(sliceString(strPart, sliceStart, sliceEnd));
         }},
-        
         {"{split(", [&](const std::string& placeholder) {
             const size_t openParen = placeholder.find('(');
-            const size_t closeParen = placeholder.find(')');
+            const size_t closeParen = placeholder.rfind(')');
         
-            if (openParen == std::string::npos || closeParen == std::string::npos || closeParen <= openParen) {
+            if (openParen == std::string::npos || closeParen == std::string::npos || 
+                closeParen <= openParen) {
                 return NULL_STR;
             }
         
-            const std::string parameters = placeholder.substr(openParen + 1, closeParen - openParen - 1);
+            const std::string parameters = placeholder.substr(openParen + 1, 
+                closeParen - openParen - 1);
         
             const size_t firstCommaPos = parameters.find(',');
             const size_t lastCommaPos  = parameters.find_last_of(',');
         
-            if (firstCommaPos == std::string::npos
-             || lastCommaPos  == std::string::npos
-             || firstCommaPos == lastCommaPos) {
+            if (firstCommaPos == std::string::npos || lastCommaPos == std::string::npos ||
+                firstCommaPos == lastCommaPos) {
                 return NULL_STR;
             }
         
             std::string str = parameters.substr(0, firstCommaPos);
-            std::string delimiter = parameters.substr(firstCommaPos + 1, lastCommaPos - firstCommaPos - 1);
+            std::string delimiter = parameters.substr(firstCommaPos + 1, 
+                lastCommaPos - firstCommaPos - 1);
             std::string indexStr = parameters.substr(lastCommaPos + 1);
         
             trim(str);
@@ -3171,33 +3271,17 @@ bool applyPlaceholderReplacements(std::vector<std::string>& cmd, const std::stri
             }
         
             std::string result = splitStringAtIndex(str, delimiter, ult::stoi(indexStr));
-        
             return result.empty() ? NULL_STR : result;
         }},
-        {"{math(", [&](const std::string& placeholder) { return returnOrNull(handleMath(placeholder)); }},
-        {"{length(", [&](const std::string& placeholder) { return returnOrNull(handleLength(placeholder)); }},
+        {"{math(", [&](const std::string& placeholder) { return handleMath(placeholder); }},
+        {"{length(", [&](const std::string& placeholder) { return handleLength(placeholder); }},
     };
 
-    //generalPlaceholders = {
-    //    {"{ram_vendor}", memoryVendor},
-    //    {"{ram_model}", memoryModel},
-    //    {"{ams_version}", amsVersion},
-    //    {"{hos_version}", hosVersion},
-    //    {"{cpu_speedo}", ult::to_string(cpuSpeedo0)},
-    //    {"{cpu_iddq}", ult::to_string(cpuIDDQ)},
-    //    {"{gpu_speedo}", ult::to_string(cpuSpeedo2)},
-    //    {"{gpu_iddq}", ult::to_string(gpuIDDQ)},
-    //    {"{soc_speedo}", ult::to_string(socSpeedo0)},
-    //    {"{soc_iddq}", ult::to_string(socIDDQ)},
-    //    {"{title_id}", getTitleIdAsString()}
-    //};
     updateGeneralPlaceholders();
 
     // Iterate through each command and replace placeholders
     for (auto& arg : cmd) {
-        //std::string originalArg = arg; // Store original to compare later
-        
-        // Replace general placeholders - modify these functions to return bool
+        // Replace general placeholders
         if (replacePlaceholdersInArg(arg, generalPlaceholders)) {
             replacementsMade = true;
         }
@@ -3207,15 +3291,10 @@ bool applyPlaceholderReplacements(std::vector<std::string>& cmd, const std::stri
             replacementsMade = true;
         }
 
-        // Resolve nested placeholders - modify this function to return bool
+        // Resolve nested placeholders - only if all internals resolve
         if (replacePlaceholdersRecursively(arg, placeholders)) {
             replacementsMade = true;
         }
-        
-        // Alternative: Simple string comparison if you can't modify the helper functions
-        // if (arg != originalArg) {
-        //     replacementsMade = true;
-        // }
     }
     
     return replacementsMade;
@@ -3718,7 +3797,7 @@ void handleCopyCommand(const std::vector<std::string>& cmd, const std::string& p
         // Only create filterSet if filter file exists
         std::unique_ptr<std::unordered_set<std::string>> filterSet;
         if (!filterListPath.empty()) {
-            filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath));
+            filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath, packagePath));
         }
         
         const size_t listSize = std::min(sourceFilesList.size(), destinationFilesList.size());
@@ -3761,7 +3840,13 @@ void handleCopyCommand(const std::vector<std::string>& cmd, const std::string& p
         }
         
         if (sourcePath.find('*') != std::string::npos) {
-            copyFileOrDirectoryByPattern(sourcePath, destinationPath, logSource, logDestination);
+            std::unique_ptr<std::unordered_set<std::string>> filterSet;
+            if (!filterListPath.empty()) {
+                filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath, packagePath));
+            }
+            copyFileOrDirectoryByPattern(sourcePath, destinationPath, logSource, logDestination, filterSet.get());
+
+            //copyFileOrDirectoryByPattern(sourcePath, destinationPath, logSource, logDestination);
         } else {
             const long long totalSize = getTotalSize(sourcePath);
             long long totalBytesCopied = 0;
@@ -3782,7 +3867,7 @@ void handleDeleteCommand(const std::vector<std::string>& cmd, const std::string&
         // Only create filterSet if filter file exists
         std::unique_ptr<std::unordered_set<std::string>> filterSet;
         if (!filterListPath.empty()) {
-            filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath));
+            filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath, packagePath));
         }
         
         for (size_t i = 0; i < sourceFilesList.size(); ++i) {
@@ -3795,7 +3880,7 @@ void handleDeleteCommand(const std::vector<std::string>& cmd, const std::string&
             const bool shouldDelete = !filterSet || filterSet->find(sourcePath) == filterSet->end();
             
             if (shouldDelete) {
-                deleteFileOrDirectory(sourcePath);
+                deleteFileOrDirectory(sourcePath, logSource);
             }
             
             // Clear the vector element immediately to free memory
@@ -3822,7 +3907,12 @@ void handleDeleteCommand(const std::vector<std::string>& cmd, const std::string&
         
         // Perform the delete operation
         if (sourcePath.find('*') != std::string::npos) {
-            deleteFileOrDirectoryByPattern(sourcePath, logSource);
+            // Load filterSet for single path operations
+            std::unique_ptr<std::unordered_set<std::string>> filterSet;
+            if (!filterListPath.empty()) {
+                filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath, packagePath));
+            }
+            deleteFileOrDirectoryByPattern(sourcePath, logSource, filterSet.get());
         } else {
             deleteFileOrDirectory(sourcePath, logSource);
         }
@@ -3886,12 +3976,12 @@ void handleMoveCommand(const std::vector<std::string>& cmd, const std::string& p
         // Load filter sets (these are typically small)
         std::unique_ptr<std::unordered_set<std::string>> copyFilterSet;
         if (!copyFilterListPath.empty()) {
-            copyFilterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(copyFilterListPath));
+            copyFilterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(copyFilterListPath, packagePath));
         }
         
         std::unique_ptr<std::unordered_set<std::string>> filterSet;
         if (!filterListPath.empty()) {
-            filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath));
+            filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath, packagePath));
         }
     
         // Pre-allocate strings to avoid reallocations in loop
@@ -4070,7 +4160,14 @@ void handleMoveCommand(const std::vector<std::string>& cmd, const std::string& p
         
         // Perform the move operation
         if (sourcePath.find('*') != std::string::npos) {
-            moveFilesOrDirectoriesByPattern(sourcePath, destinationPath, logSource, logDestination);
+            std::unique_ptr<std::unordered_set<std::string>> filterSet;
+            if (!filterListPath.empty()) {
+                filterSet = std::make_unique<std::unordered_set<std::string>>(readSetFromFile(filterListPath, packagePath));
+            }
+            
+            moveFilesOrDirectoriesByPattern(sourcePath, destinationPath, logSource, logDestination, filterSet.get());
+
+            //moveFilesOrDirectoriesByPattern(sourcePath, destinationPath, logSource, logDestination);
         } else {
             moveFileOrDirectory(sourcePath, destinationPath, logSource, logDestination);
         }
@@ -5087,16 +5184,16 @@ void executeInterpreterCommands(std::vector<std::vector<std::string>>&& commands
     if (!ult::limitedMemory && ult::useSoundEffects) {
         //clearSoundCacheNow.store(true, std::memory_order_release);
         if (triggerEnterSound.exchange(false)) {
-            ult::AudioPlayer::playEnterSound();
+            ult::Audio::playEnterSound();
         } else if (triggerOnSound.exchange(false)) {
-            ult::AudioPlayer::playOnSound();
+            ult::Audio::playOnSound();
         } else if (triggerOffSound.exchange(false)) {
-            ult::AudioPlayer::playOffSound();
+            ult::Audio::playOffSound();
         }
 
-        //ult::AudioPlayer::exit();
+        //ult::Audio::exit();
 
-        ult::AudioPlayer::unloadAllSounds({ult::AudioPlayer::SoundType::Wall});
+        ult::Audio::unloadAllSounds({ult::Audio::SoundType::Wall});
         //clearSoundCacheNow.wait(true, std::memory_order_acquire);
     }
     
